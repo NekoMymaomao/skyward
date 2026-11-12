@@ -1502,7 +1502,9 @@ fn finished(
             let y = widgets::list(c, t, f, top, &[standing(l.pick(["刷入成功", "刷入成功", "Flashed"]), GREEN, Icon::Install, &detail)]).bottom;
             let mut rows = vec![restart];
             let mut acts = vec![Action::RebootTo(Target::System)];
-            if *partition == "recovery" {
+            // A VAB phone keeps its recovery in boot; restarting into
+            // recovery brings up the very image just written there.
+            if *partition == "recovery" || *partition == "boot" {
                 rows.push(Row::new(l.pick(["重启到恢复模式", "重新啟動到復原模式", "Reboot to recovery"])).icon(ORANGE, Icon::Power));
                 acts.push(Action::RebootTo(Target::Recovery));
             }

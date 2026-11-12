@@ -119,6 +119,7 @@ the data partition.
 | 🚧 REDMI K90 Ultra | `warsaw` | OS3.0.309.0.WHPCNXM (Android 16) |
 | 🚧 REDMI K100 Pro | `athens` | OS4.0.4.0.XPICNXM (Android 17) |
 | 🚧 REDMI K100 Pro Max | `songyuan` | OS4.0.4.0.XGNCNXM (Android 17) |
+| 🚧 Xiaomi Pad 5 | `nabu` | OS1.0.3.0.TKXCNXM (Android 13, recovery in boot) |
 
 ## Installing Skyward
 
@@ -133,6 +134,36 @@ unzip skyward-v0.2.0-nezha-OS4.0.4.0.XPACNXM.zip
 fastboot flash recovery skyward-v0.2.0-nezha-OS4.0.4.0.XPACNXM.img
 fastboot reboot recovery
 ```
+
+A virtual A/B device may have no recovery partition of its own. Xiaomi Pad 5
+(`nabu`) is one: its recovery is the ramdisk of boot, the way TWRP's
+`BOARD_USES_RECOVERY_AS_BOOT` builds it. An update rewrites boot, vendor_boot
+and dtbo together, so Skyward flashes and keeps the three as one boot set.
+
+`nabu` is not published in Releases: its image is built by hand from the
+OrangeFox R11 boot, keeping the stock kernel, first ramdisk, FBE decrypt
+scripts and panel driver, and only dropping Skyward into `system/bin/recovery`;
+it is then flashed with the device's own vendor_boot and dtbo. Build it with
+`tools/inject-nabu.sh` in the repository:
+
+```sh
+tools/inject-nabu.sh \
+    --skyward path/to/skyward \
+    --system-init path/to/system-init \
+    --config devices/nabu.toml \
+    --boot path/to/orangefox-boot.img \
+    --vendor-boot path/to/vendor_boot.img \
+    --dtbo path/to/dtbo.img \
+    --out out/
+fastboot flash boot_a        out/boot.img
+fastboot flash vendor_boot_a out/vendor_boot.img
+fastboot flash dtbo_a        out/dtbo.img
+fastboot reboot recovery
+```
+
+Ask `fastboot getvar current-slot`, or `getprop ro.boot.slot_suffix` in the
+running system, which slot that is. The installed system still starts from
+the same boot partition, as the stock init is left in place.
 
 Afterwards Skyward updates itself over Wi-Fi from its newest release, on the
 Skyward update page in Settings; a newer image, unzipped, also installs from its own
@@ -219,6 +250,21 @@ in, and checks its SHA-256 against the device file:
 
 ```sh
 target/release/skyward-pack stock --config devices/nezha.toml --out target/stock/nezha/recovery.img
+```
+
+`[device] recovery_partition` names the partition that holds the recovery,
+`recovery` unless a VAB device keeps it in `boot`; the stock image is taken
+from that partition. A device whose `[stock] recovery` sum is empty has not
+been pinned to a build yet: `skyward-pack stock --out` prints the sum to name
+in the configuration, and CI builds no image for it until then.
+
+A ported system with a rewritten vendor is better built on its own boot
+partition than on the stock package. Read the whole partition, ending in its
+AVB footer, and hand it to `skyward-pack recovery --stock`:
+
+```sh
+adb shell 'dd if=/dev/block/by-name/boot_a of=/data/local/tmp/boot.img'
+adb pull /data/local/tmp/boot.img stock/boot.img
 ```
 
 Then it builds the image on top of it:

@@ -88,15 +88,26 @@ pub struct DeviceConfig {
 
 /// The stock build a recovery is made on: the phone maker's full update
 /// package of it, whose recovery partition the recovery is built on top
-/// of, and that partition as it should come out of the package.
+/// of, and that partition as it should come out of the package. A device
+/// whose base images are handed to the packer instead names no package;
+/// its companion images can be pinned by their own sums.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Stock {
     /// The build's version, such as OS4.0.4.0.XPACNXM.
     pub version: String,
-    /// Where the package is downloaded from, over HTTPS.
+    /// Where the package is downloaded from, over HTTPS. Empty when the
+    /// images are supplied by hand rather than taken out of a package.
+    #[serde(default)]
     pub package: String,
-    /// The recovery partition's SHA-256, in lowercase hex.
+    /// The recovery partition's SHA-256, in lowercase hex. Empty when the
+    /// build has not been pinned yet: `skyward-pack stock --out` then says
+    /// what the sum is instead of checking it.
+    #[serde(default)]
     pub recovery: String,
+    /// Each companion partition's SHA-256, in lowercase hex, by partition
+    /// name. Empty sums are pins yet to be made.
+    #[serde(default)]
+    pub images: std::collections::BTreeMap<String, String>,
 }
 
 /// What brings the phone's WLAN up inside a recovery, which loads none of
@@ -265,6 +276,27 @@ pub struct Device {
     pub model: String,
     #[serde(default = "default_true")]
     pub ab: bool,
+    /// The partition that holds this recovery, in each slot. Most phones
+    /// have a recovery partition of their own; a VAB phone whose recovery
+    /// lives in boot instead names `boot` here, as TWRP's
+    /// BOARD_USES_RECOVERY_AS_BOOT does. The stock build is taken from the
+    /// same partition, and an install or an update writes it back there.
+    #[serde(default = "default_recovery_partition")]
+    pub recovery_partition: String,
+    /// Other partitions flashed and kept beside the recovery partition as
+    /// one set. A VAB tablet whose recovery lives in boot needs its
+    /// vendor_boot (the first-stage ramdisk and the DTB) and dtbo to start,
+    /// and an OTA writes all of them, so keeping the recovery means keeping
+    /// the whole set together.
+    #[serde(default)]
+    pub companions: Vec<String>,
+    /// Paths taken out of the stock ramdisk before Skyward is put in, when
+    /// the only image a device offers is a custom recovery's. Each is a
+    /// ramdisk-relative name or folder prefix; a folder takes its whole
+    /// tree with it. The stock init, properties, fstab, SELinux policy and
+    /// libraries stay.
+    #[serde(default)]
+    pub strip: Vec<String>,
     /// SoC marketing name shown on the About page.
     #[serde(default)]
     pub soc: Option<Names>,
@@ -469,6 +501,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_recovery_partition() -> String {
+    "recovery".into()
+}
+
 fn default_os_version_prop() -> String {
     "ro.build.display.id".into()
 }
@@ -494,6 +530,16 @@ pub fn codename(text: &str) -> Result<String> {
 }
 
 impl DeviceConfig {
+    /// The partitions flashed, held and updated as one set, the recovery
+    /// partition first and its companions after it. Most devices have only
+    /// the one; a VAB tablet whose recovery is in boot brings vendor_boot
+    /// and dtbo along, as an OTA overwrites all of them together.
+    pub fn partitions(&self) -> Vec<&str> {
+        std::iter::once(self.device.recovery_partition.as_str())
+            .chain(self.device.companions.iter().map(String::as_str))
+            .collect()
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref();
         let text = std::fs::read_to_string(p)
@@ -520,6 +566,18 @@ impl DeviceConfig {
         }
         for name in &cfg.partitions.mounted {
             ensure!(!name.is_empty() && !name.contains('/'), "[partitions] mounted: {name} is not a partition's name");
+        }
+        let recovery = &cfg.device.recovery_partition;
+        ensure!(!recovery.is_empty() && !recovery.contains('/'), "[device] recovery_partition: {recovery} is not a partition's name");
+        let mut seen = std::collections::BTreeSet::from([recovery.as_str()]);
+        for name in &cfg.device.companions {
+            ensure!(!name.is_empty() && !name.contains('/'), "[device] companions: {name} is not a partition's name");
+            ensure!(seen.insert(name.as_str()), "[device] companions: {name} is named twice in the set");
+        }
+        for prefix in &cfg.device.strip {
+            let path = Path::new(prefix);
+            let plain = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+            ensure!(!prefix.is_empty() && !path.is_absolute() && plain, "[device] strip: {prefix} is not a ramdisk-relative path");
         }
         for s in cfg.services.iter().filter(|s| s.oneshot) {
             let waits = s.ready_property.is_some() || s.ready_service.is_some() || s.ready_hardware_service.is_some();
@@ -572,18 +630,28 @@ impl DeviceConfig {
             }
         }
         if let Some(stock) = &cfg.stock {
-            let name = stock.package.rsplit('/').next().unwrap_or_default();
-            ensure!(
-                stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version) && !stock.version.is_empty(),
-                "[stock] package: {} is not an HTTPS address of the full package of {}",
-                stock.package,
-                stock.version
-            );
-            ensure!(
-                stock.recovery.len() == 64 && stock.recovery.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-                "[stock] recovery: {} is not a SHA-256 in lowercase hex",
-                stock.recovery
-            );
+            ensure!(!stock.version.is_empty(), "[stock] version: a build is named by its version");
+            // A device whose base images are supplied by hand, rather than
+            // taken out of an OTA package, names no package and may leave
+            // the sums unpinned until the images have been read once.
+            if !stock.package.is_empty() {
+                let name = stock.package.rsplit('/').next().unwrap_or_default();
+                ensure!(
+                    stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version),
+                    "[stock] package: {} is not an HTTPS address of the full package of {}",
+                    stock.package,
+                    stock.version
+                );
+            }
+            for (partition, sum) in std::iter::once((&cfg.device.recovery_partition, &stock.recovery)).chain(stock.images.iter()) {
+                ensure!(
+                    sum.is_empty() || (sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+                    "[stock] image {partition}: {sum} is not a SHA-256 in lowercase hex"
+                );
+            }
+            for partition in stock.images.keys() {
+                ensure!(cfg.device.companions.contains(partition), "[stock] images: {partition} is not a companion of {}", cfg.device.recovery_partition);
+            }
         }
         if let Some(wlan) = &cfg.wlan {
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
@@ -627,10 +695,18 @@ mod tests {
         assert_eq!(cfg.device.codename, "nezha");
         assert!(cfg.device.ab);
         assert_eq!(cfg.device.os_version_prop, "ro.build.display.id");
+        assert_eq!(cfg.device.recovery_partition, "recovery");
         assert_eq!(cfg.modules.sources, default_module_sources());
         assert!(cfg.modules.load.is_empty());
         assert_eq!((cfg.firmware, cfg.wlan, cfg.update), (None, None, None), "a phone may have none of them");
         assert_eq!(cfg.logd, None, "a recovery's own logd usually has all it needs");
+    }
+
+    #[test]
+    fn a_vab_tablet_keeps_its_recovery_in_boot() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/nabu.toml")).unwrap();
+        assert_eq!((cfg.device.codename.as_str(), cfg.device.recovery_partition.as_str()), ("nabu", "boot"));
+        assert!(cfg.device.ab, "a virtual A/B device still has two slots");
     }
 
     #[test]
@@ -850,10 +926,18 @@ mod tests {
             (include_str!("../../../devices/miro.toml"), "OS3.0.305.0.WOMCNXM"),
             (include_str!("../../../devices/annibale.toml"), "OS3.0.307.0.WPKCNXM"),
             (include_str!("../../../devices/warsaw.toml"), "OS3.0.309.0.WHPCNXM"),
+            (include_str!("../../../devices/nabu.toml"), "OS1.0.3.0.TKXCNXM"),
         ] {
             let stock = DeviceConfig::parse(text).unwrap().stock.expect("a stock build to build on");
             assert_eq!(stock.version, version);
-            assert!(stock.package.ends_with(".zip") && stock.package.contains(&format!("/{version}/")), "{}", stock.package);
+            // A device built by hand from images handed over, rather than by
+            // skyward-pack from a package, names no package; the rest say
+            // where the full package of this build is had over HTTPS.
+            if stock.package.is_empty() {
+                assert!(stock.recovery.is_empty(), "a hand-built device names no package and no sum: {}", text.lines().next().unwrap_or(""));
+            } else {
+                assert!(stock.package.ends_with(".zip") && stock.package.contains(&format!("/{version}/")), "{}", stock.package);
+            }
         }
     }
 

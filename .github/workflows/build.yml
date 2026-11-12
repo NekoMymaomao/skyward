@@ -104,8 +104,12 @@ jobs:
       - name: Read the stock build the recovery is made on
         id: stock
         run: tools/skyward-pack stock --config "devices/${{ matrix.device }}.toml" >> "$GITHUB_OUTPUT"
+      # A device whose stock build has not been pinned yet (an empty
+      # recovery sum) is config-only: it is linted and tested above, but no
+      # image is built for it until the sum is named.
       - name: Restore the stock recovery
         id: cache
+        if: steps.stock.outputs.recovery != ''
         uses: actions/cache@v6
         with:
           path: stock/recovery.img
@@ -113,14 +117,16 @@ jobs:
       # Only what the recovery partition takes is read of the package,
       # which is several gigabytes in all.
       - name: Take the recovery partition out of the stock package
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.stock.outputs.recovery != '' && steps.cache.outputs.cache-hit != 'true'
         run: tools/skyward-pack stock --config "devices/${{ matrix.device }}.toml" --out stock/recovery.img
       - name: Check the stock recovery
+        if: steps.stock.outputs.recovery != ''
         env:
           RECOVERY: ${{ steps.stock.outputs.recovery }}
         run: echo "$RECOVERY  stock/recovery.img" | sha256sum --check
       - name: Pack the recovery
         id: pack
+        if: steps.stock.outputs.recovery != ''
         env:
           DEVICE: ${{ matrix.device }}
           STOCK: ${{ steps.stock.outputs.version }}
@@ -135,12 +141,14 @@ jobs:
       # The image is the whole partition, flashed as it is, and most of it
       # is the room the recovery leaves empty; it is handed out zipped.
       - name: Zip the image
+        if: steps.stock.outputs.recovery != ''
         working-directory: out
         env:
           NAME: ${{ steps.pack.outputs.name }}
         run: zip -9 "$NAME.zip" "$NAME.img"
       # The artifact takes the zip's name.
       - uses: actions/upload-artifact@v7
+        if: steps.stock.outputs.recovery != ''
         with:
           path: out/${{ steps.pack.outputs.name }}.zip
           archive: false
@@ -179,6 +187,8 @@ jobs:
           zips=()
           for config in devices/*.toml; do
             device=$(basename "$config" .toml)
+            pinned=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb")).get("stock", {}).get("recovery", ""))' "$config")
+            if [ -z "$pinned" ]; then continue; fi
             model=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["device"]["model"])' "$config")
             zip=$(ls images/skyward-"$GITHUB_REF_NAME"-"$device"-*.zip)
             zips+=("$zip#$model ($device)")

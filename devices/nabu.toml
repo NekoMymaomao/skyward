@@ -1,0 +1,123 @@
+# Xiaomi Pad 5 (nabu), SM8150 / Snapdragon 860, kernel 4.14, Android 12L
+# vendor baseline, virtual A/B with no recovery partition of its own.
+#
+# TWRP brings this tablet up with BOARD_USES_RECOVERY_AS_BOOT: the recovery
+# is the ramdisk of boot, and boot is 128 MiB in each slot. Skyward does the
+# same here, so the stock image below is taken from the boot partition and
+# the finished image is flashed to boot_a or boot_b, never to recovery.
+
+[device]
+codename = "nabu"
+brand = "Xiaomi"
+model = "Xiaomi Pad 5"
+ab = true
+recovery_partition = "boot"
+# The boot set this recovery is flashed and kept as one: an update rewrites
+# boot, vendor_boot and dtbo together, so the recovery's kernel, its
+# first-stage ramdisk and its device tree stay in step. The recovery lives
+# in boot; vendor_boot and dtbo are written and kept beside it.
+companions = ["vendor_boot", "dtbo"]
+soc = { hans = "骁龙®860移动平台", hant = "Snapdragon® 860 行動平台", en = "Snapdragon® 860 Mobile Platform" }
+os_version_prop = "ro.build.display.id"
+
+[display]
+# The panel, as the device brings it up: 2560x1660 in its landscape
+# holding, density taken from the running system (wm density) so the pages
+# lay out at whatever the build sets. These are what the preview and the
+# About page show; the running pages take their size from the display.
+width = 2560
+height = 1660
+# Skyward needs one density to lay the pages out; 320 is the tablet's stock
+# one, 1 dp = 2 px. Change it if wm density says otherwise.
+density = 320
+diagonal = 11.0
+corner_radius = 24
+
+[modules]
+# First-stage modules live in the vendor_boot ramdisk, the rest in vendor.
+# A 4.14 vendor has no vendor_dlkm partition.
+sources = ["vendor_boot", "vendor"]
+# The Novatek NT36523 touch controller on qupv3_se18_spi, named by
+# drivers/input/touchscreen/nt36523/Makefile as nt36523_touch.ko. A module
+# the kernel already has is left alone. The controller reports positions
+# itself, so this tablet needs no touch program or sysfs write, unlike the
+# phones' panels that send raw frames.
+load = ["nt36523_touch"]
+
+# The WLAN and secure-world firmware is on the modem partition, mounted at
+# /vendor/firmware_mnt by the phone's own fstab, which a recovery leaves
+# unmounted.
+[firmware]
+partition = "modem"
+
+# /mnt/vendor/persist, where the secure world keeps its files and the WLAN
+# its MAC address.
+[partitions]
+mounted = ["persist"]
+
+# WCN3990 on SM8150, driven by qcacld-3.0. These names follow the stock
+# vendor layout; a ported ROM with a rewritten vendor may name the module
+# or the firmware paths differently, so check /vendor/lib/modules and
+# /vendor/etc/wifi on the running system before relying on Wi-Fi.
+[wlan]
+modules = ["qca_cld3_wlan"]
+firmware = [
+    { name = "wlan/qca_cld/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/WCNSS_qcom_cfg.ini" },
+    { name = "wlan/qca_cld/wlan_mac.bin", partition = "persist", path = "wlan/wlan_mac.bin" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/vendor/lib64", "/system/lib64"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+
+# The server the stock updater of the Chinese system asks.
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+# nabu has no recovery partition: its recovery is the ramdisk of boot, and
+# the recovery is built by hand rather than by skyward-pack. The base is
+# the OrangeFox R11 recovery (which already brings the 4.14 kernel, the
+# first-stage ramdisk, the FBE decrypt scripts and the panel's driver),
+# with Skyward overwritten into system/bin/recovery; vendor_boot and dtbo
+# are the device's own, flashed beside boot as one boot set. The recovery
+# and companion sums below name that base, so a flashed image can be
+# checked against it; they are not read by skyward-pack, which nabu does
+# not use. Rebuild with tools/inject-nabu.sh against the built skyward and
+# system-init binaries and these base images.
+#
+#   boot.img        ddbb44db7209bd8913fc4dd5f7b55045ebbe1cec4d3a16533d7eafb7fc7d4566
+#   vendor_boot.img b1b4e4d9bfc1b3a6457667ed7d8baa434bd18013c0bb3f8ce3dd72698f73e7dd
+#   dtbo.img        c48a31cdea33cc78cb93dea60bd2b5917f4a125359d26288827ff333e084c6e8
+[stock]
+version = "OS1.0.3.0.TKXCNXM"
+package = ""
+recovery = ""
+
+
+# The partitions holding the baseband's settings and the sensors'
+# calibration, as the stock recovery's twrp.flags names them.
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = [
+    "vendor/tzstorage",
+    "vendor/qtee",
+    "vendor/mitee",
+    "vendor/goodix",
+    "vendor/fingerprint",
+    "vendor/fpdata",
+    "vendor/misc/mi_fp",
+]
+
+[wipe]
+logs = [
+    "/data/miuilog",
+    "/data/vendor/diag",
+    "/data/vendor/bsplog",
+    "/data/vendor/log",
+    "/data/vendor/ramdump",
+    "/data/vendor/ramdump_ssr",
+    "/data/vendor/ssrdump",
+    "/data/vendor/tombstones",
+    "/data/vendor/wlan_logs",
+]

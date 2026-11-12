@@ -10,8 +10,6 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
-const PARTITION: &str = "recovery";
-
 /// The image the zip at `path` holds, its only entry, read whole.
 pub fn unzip(path: &Path) -> Result<Vec<u8>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -36,10 +34,10 @@ pub fn check(image: &[u8], codename: &str) -> Result<()> {
 /// The slots whose recovery partition, among the links in `dir`, the newer
 /// build goes into, slot A first: `next`, the slot that starts next, and
 /// any other whose partition holds Skyward now, any build of it.
-pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
+pub fn slots(dir: &Path, next: Slot, partition: &str) -> Result<Vec<Slot>> {
     let mut slots = Vec::new();
     for slot in [Slot::A, Slot::B] {
-        let path = image::device(dir, PARTITION, slot);
+        let path = image::device(dir, partition, slot);
         let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         image::drop_cache(&file).with_context(|| format!("drop the cached pages of {}", path.display()))?;
         if slot == next || image::is_skyward(&mut file).with_context(|| format!("look into {}", path.display()))? {
@@ -51,8 +49,8 @@ pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
 
 /// Write `image` into the recovery partitions of `slots`, among the links
 /// in `dir`, and read each back; `progress` hears the bytes so far, of all.
-pub fn write(dir: &Path, image: &[u8], slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
-    let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(dir, PARTITION, slot)).collect();
+pub fn write(dir: &Path, image: &[u8], slots: &[Slot], partition: &str, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
     image::flash(&mut Cursor::new(image), image.len() as u64, &devices, progress)
 }
 
@@ -112,10 +110,10 @@ mod tests {
     fn the_build_goes_where_the_phone_starts_next_and_where_skyward_is() {
         let (skyward, stock) = (skyward_for("ishtar"), recovery(false));
         let size = skyward.len().max(stock.len()) + 4096;
-        assert_eq!(slots(partitions(&skyward, &stock, size).path(), Slot::A).unwrap(), [Slot::A]);
-        assert_eq!(slots(partitions(&skyward, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "an older build in the other slot");
-        assert_eq!(slots(partitions(&stock, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "Skyward started without being flashed");
-        assert_eq!(slots(partitions(&stock, &stock, size).path(), Slot::B).unwrap(), [Slot::B]);
+        assert_eq!(slots(partitions(&skyward, &stock, size).path(), Slot::A, "recovery").unwrap(), [Slot::A]);
+        assert_eq!(slots(partitions(&skyward, &skyward, size).path(), Slot::A, "recovery").unwrap(), [Slot::A, Slot::B], "an older build in the other slot");
+        assert_eq!(slots(partitions(&stock, &skyward, size).path(), Slot::A, "recovery").unwrap(), [Slot::A, Slot::B], "Skyward started without being flashed");
+        assert_eq!(slots(partitions(&stock, &stock, size).path(), Slot::B, "recovery").unwrap(), [Slot::B]);
     }
 
     #[test]
@@ -124,7 +122,7 @@ mod tests {
         let size = older.len().max(newer.len()) + 4096;
         let dir = partitions(&older, &stock, size);
         let mut told = Vec::new();
-        write(dir.path(), &newer, &[Slot::A], &mut |done, total| told.push((done, total))).unwrap();
+        write(dir.path(), &newer, &[Slot::A], "recovery", &mut |done, total| told.push((done, total))).unwrap();
         let total = 2 * newer.len() as u64;
         assert_eq!(told.last(), Some(&(total, total)), "written and read back");
         assert_eq!(&std::fs::read(dir.path().join("recovery_a")).unwrap()[..newer.len()], &newer[..]);

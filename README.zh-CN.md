@@ -113,6 +113,7 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 | 🚧 REDMI K90 Ultra | `warsaw` | OS3.0.309.0.WHPCNXM（Android 16） |
 | 🚧 REDMI K100 Pro | `athens` | OS4.0.4.0.XPICNXM（Android 17） |
 | 🚧 REDMI K100 Pro Max | `songyuan` | OS4.0.4.0.XGNCNXM（Android 17） |
+| 🚧 小米平板 5 | `nabu` | OS1.0.3.0.TKXCNXM（Android 13，recovery 位于 boot） |
 
 ## 安装 Skyward
 
@@ -124,7 +125,28 @@ fastboot flash recovery skyward-v0.2.0-nezha-OS4.0.4.0.XPACNXM.img
 fastboot reboot recovery
 ```
 
-之后连接 WLAN，就可以在“设置”的“Skyward 更新”页面更新到最新版本，也可以在 Skyward 自己的“安装”页面安装解压出来的新版镜像。打开 **自动重新刷入 Skyward** 之后，系统更新或者刷机包覆盖 recovery 分区的时候，Skyward 会重新刷回这些分区。
+虚拟 A/B 设备可能没有独立的 recovery 分区。小米平板 5（`nabu`）就是如此：它的 recovery 位于 boot 的 ramdisk，与 TWRP 的 `BOARD_USES_RECOVERY_AS_BOOT` 一致。一次系统更新会同时改写 boot、vendor_boot 和 dtbo，所以 Skyward 把这三个分区作为一个启动集一起刷入、一起保留。
+
+`nabu` 不发布在 Releases 中：它的镜像以 OrangeFox R11 的 boot 为基础手动构建——保留原厂内核、第一段 ramdisk、FBE 解密脚本和面板驱动，只把 Skyward 覆盖进 `system/bin/recovery`，然后和原厂的 vendor_boot、dtbo 一起刷入。构建方法见仓库里的 `tools/inject-nabu.sh`：
+
+```sh
+tools/inject-nabu.sh \
+    --skyward path/to/skyward \
+    --system-init path/to/system-init \
+    --config devices/nabu.toml \
+    --boot path/to/orangefox-boot.img \
+    --vendor-boot path/to/vendor_boot.img \
+    --dtbo path/to/dtbo.img \
+    --out out/
+fastboot flash boot_a        out/boot.img
+fastboot flash vendor_boot_a out/vendor_boot.img
+fastboot flash dtbo_a        out/dtbo.img
+fastboot reboot recovery
+```
+
+槽位可以用 `fastboot getvar current-slot`，或者在系统里用 `getprop ro.boot.slot_suffix` 查到。原厂 init 仍在，所以同一个 boot 分区照常启动已安装的系统。
+
+之后连接 WLAN，就可以在“设置”的“Skyward 更新”页面更新到最新版本，也可以在 Skyward 自己的“安装”页面安装解压出来的新版镜像。打开 **自动重新刷入 Skyward** 之后，系统更新或者刷机包覆盖 boot、vendor_boot、dtbo 这些分区的时候，Skyward 会把整个启动集重新刷回。
 
 Skyward 中的 adb 是 root shell，手机上无需授权：手机处于 recovery 的时候，任何人拿到手机和数据线都能访问其中的存储。
 
@@ -166,6 +188,15 @@ RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 b
 
 ```sh
 target/release/skyward-pack stock --config devices/nezha.toml --out target/stock/nezha/recovery.img
+```
+
+`[device] recovery_partition` 指定承载 recovery 的分区，默认是 `recovery`，虚拟 A/B 设备把它设为 `boot`；原厂镜像也从这个分区取出。`[stock] recovery` 为空表示尚未固定到某个构建：`skyward-pack stock --out` 会打印实际的 SHA-256，把它填进配置之后 CI 才会为该机型出包。
+
+vendor 被改过的移植系统，用设备自己的 boot 分区作基础比官方包更合适。读出整个分区（末尾要带 AVB footer），直接交给 `skyward-pack recovery --stock`：
+
+```sh
+adb shell 'dd if=/dev/block/by-name/boot_a of=/data/local/tmp/boot.img'
+adb pull /data/local/tmp/boot.img stock/boot.img
 ```
 
 然后在它的基础上构建镜像：

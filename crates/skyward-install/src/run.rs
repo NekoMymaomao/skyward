@@ -635,9 +635,9 @@ fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
     if !ctx.options.keep {
         return Ok(None);
     }
-    let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
+    let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current, &ctx.options.recovery_partition, &ctx.options.companions).context("hold this recovery from its partition")?;
     if kept.is_none() {
-        let _ = kmsg("install: the recovery partition does not hold Skyward, so there is none to keep");
+        let _ = kmsg(&format!("install: the {} partition does not hold Skyward, so there is none to keep", ctx.options.recovery_partition));
     }
     Ok(kept)
 }

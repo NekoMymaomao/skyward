@@ -698,7 +698,7 @@ fn install_asked(cfg: &DeviceConfig, app: &App, pending: Pending) -> Result<Inst
             mount::mount_ro(Path::new(&fstab::device(&cache)?), at)?;
         }
     }
-    Installer::asked(pending.package, pending.retry, detach(cfg.services.clone()), install_options(app))
+    Installer::asked(pending.package, pending.retry, detach(cfg.services.clone()), install_options(app, cfg))
 }
 
 /// Where a reboot rescue asked for goes: the target, and whether it is
@@ -978,8 +978,13 @@ fn detach(services: Vec<Service>) -> Detach {
 /// are set: puts Skyward back into the recovery partitions it writes over,
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
-fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+fn install_options(app: &App, cfg: &DeviceConfig) -> Options {
+    Options {
+        keep: app.state.keep_recovery && app.state.recovery_partitions,
+        signed: app.state.check_signature,
+        recovery_partition: cfg.device.recovery_partition.clone(),
+        companions: cfg.device.companions.clone(),
+    }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1176,7 +1181,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // partitions in both slots, which a switch writes.
     let by_name = Path::new(skyward_block::BY_NAME);
     let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
-    app.state.recovery_partitions = both("recovery")?;
+    // A VAB phone has no recovery partition of its own: this recovery is
+    // in boot there, as TWRP's BOARD_USES_RECOVERY_AS_BOOT puts it.
+    app.state.recovery_partitions = both(&cfg.device.recovery_partition)?;
     app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
     // The second system's work; the systems are read at once, for the home
     // page to name the one that starts, once a switch cut off before is
@@ -1233,12 +1240,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         }
         Work::Sideload { .. } => {
             app.start_sideload();
-            installer = Some(Installer::start(detach(cfg.services.clone()), install_options(&app))?);
+            installer = Some(Installer::start(detach(cfg.services.clone()), install_options(&app, cfg))?);
             sideloading = true;
         }
         Work::Rescue => {
             app.start_rescue();
-            installer = Some(Installer::rescue(detach(cfg.services.clone()), install_options(&app))?);
+            installer = Some(Installer::rescue(detach(cfg.services.clone()), install_options(&app, cfg))?);
             sideloading = true;
         }
         Work::Update(update) => {
@@ -2231,7 +2238,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         if !withhold(&mut transfer, &mut app, now)? {
                             continue;
                         }
-                        installer = Some(Installer::start(detach(cfg.services.clone()), install_options(&app))?);
+                        installer = Some(Installer::start(detach(cfg.services.clone()), install_options(&app, cfg))?);
                         sideloading = true;
                     }
                     Effect::InstallFile(place, path) => {
@@ -2239,14 +2246,14 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         if !withhold(&mut transfer, &mut app, now)? {
                             continue;
                         }
-                        installer = Some(Installer::open(in_place(place, &path), detach(cfg.services.clone()), install_options(&app))?);
+                        installer = Some(Installer::open(in_place(place, &path), detach(cfg.services.clone()), install_options(&app, cfg))?);
                     }
                     Effect::InstallPath(path) => {
                         ensure!(installer.is_none(), "an installer is running already");
                         if !withhold(&mut transfer, &mut app, now)? {
                             continue;
                         }
-                        installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
+                        installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app, cfg))?);
                     }
                     Effect::Flash { partition, pick } => {
                         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
@@ -2513,7 +2520,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         ensure!(installer.is_none(), "an installer is running already");
                         skyward_sys::kmsg(&format!("updating Skyward to {}", build.name))?;
                         let path = Path::new(skyward_sys::RUN).join(&build.name);
-                        let task = updates::Task::UpdateSkyward { build, codename: cfg.device.codename.clone(), path };
+                        let task = updates::Task::UpdateSkyward { build, codename: cfg.device.codename.clone(), path, partition: cfg.device.recovery_partition.clone() };
                         skyward_updater = Some(updates::Worker::start(task, servers.clone())?);
                     }
                     Effect::StopSkywardUpdate => skyward_updater.as_ref().context("Skyward is not being updated")?.stop(),

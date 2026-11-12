@@ -8,8 +8,12 @@ license.workspace = true
 abootimg-oxide = "0.5.2"
 anyhow = { workspace = true }
 cpio = "0.4.1"
+flate2 = "1.1"
 libc = { workspace = true }
 lz4_flex = "0.14.0"
+# LZMA1 ("lzma alone") ramdisks, as some device makers and custom
+# recoveries pack them. Read on the phone too, so it is pure Rust.
+lzma-rs = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -2,11 +2,98 @@ use anyhow::{bail, Context, Result};
 use cpio::{NewcBuilder, NewcReader};
 use std::ffi::{CString, OsStr};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+/// How a boot image's ramdisk is compressed. Android's own images use LZ4
+/// in legacy framing; some makers and custom recoveries use gzip or LZMA1
+/// ("lzma alone") instead. The bootloader hands the ramdisk to the kernel
+/// as it is, so an image must be written back in the framing it came in:
+/// a 4.14 kernel may have been built to read only one of these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compression {
+    /// LZ4 legacy framing, as AOSP packs boot ramdisks.
+    #[default]
+    Lz4Legacy,
+    /// LZ4 frame format (the `lz4` tool's default, no `-l`).
+    Lz4Frame,
+    Gzip,
+    /// LZMA1 in the `.lzma` ("alone") container.
+    Lzma1,
+    /// An uncompressed newc archive.
+    Plain,
+}
+
+const LZ4_LEGACY: &[u8; 4] = b"\x02\x21\x4c\x18";
+const LZ4_FRAME: &[u8; 4] = b"\x04\x22\x4d\x18";
+const GZIP: &[u8; 2] = b"\x1f\x8b";
+const NEWC: &[u8; 6] = b"070701";
+const NEWC_CRC: &[u8; 6] = b"070702";
+
+impl Compression {
+    /// How `bytes` are compressed, by the framing's magic number.
+    pub fn of(bytes: &[u8]) -> Result<Self> {
+        if bytes.starts_with(LZ4_LEGACY) {
+            return Ok(Self::Lz4Legacy);
+        }
+        if bytes.starts_with(LZ4_FRAME) {
+            return Ok(Self::Lz4Frame);
+        }
+        if bytes.starts_with(GZIP) {
+            return Ok(Self::Gzip);
+        }
+        if bytes.starts_with(NEWC) || bytes.starts_with(NEWC_CRC) {
+            return Ok(Self::Plain);
+        }
+        // LZMA1 has no magic number: one properties byte, four of dictionary
+        // size, eight of the unpacked size (often all 0xff when unknown).
+        // Its properties byte is 0x5d for the settings every boot image
+        // uses, and the byte after the dictionary size starts the size.
+        if bytes.len() >= 13 && bytes[0] == 0x5d && bytes[5..13].iter().all(|b| *b == 0xff) {
+            return Ok(Self::Lzma1);
+        }
+        bail!("the ramdisk starts with neither LZ4, gzip, LZMA1 nor a newc archive")
+    }
+
+    /// The uncompressed newc archive `bytes` hold.
+    fn decompress(self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        match self {
+            Self::Lz4Legacy | Self::Lz4Frame => {
+                lz4_flex::frame::FrameDecoder::new(bytes).read_to_end(&mut out).context("lz4 decode")?;
+            }
+            Self::Gzip => {
+                flate2::read::GzDecoder::new(bytes).read_to_end(&mut out).context("gzip decode")?;
+            }
+            Self::Lzma1 => {
+                lzma_rs::lzma_decompress(&mut BufReader::new(bytes), &mut out).context("lzma decode")?;
+            }
+            Self::Plain => out.extend_from_slice(bytes),
+        }
+        Ok(out)
+    }
+
+    /// `archive` in this framing, to hand back to the kernel.
+    fn compress(self, archive: &[u8]) -> Result<Vec<u8>> {
+        Ok(match self {
+            Self::Lz4Legacy | Self::Lz4Frame => lz4_tool(archive)?,
+            Self::Gzip => {
+                let mut out = Vec::new();
+                flate2::read::GzEncoder::new(archive, flate2::Compression::default()).read_to_end(&mut out)?;
+                out
+            }
+            Self::Lzma1 => {
+                let mut out = Vec::new();
+                lzma_rs::lzma_compress(&mut BufReader::new(archive), &mut out).context("lzma compress")?;
+                out
+            }
+            Self::Plain => archive.to_vec(),
+        })
+    }
+}
 
 /// One cpio entry with the metadata the kernel restores when it unpacks the
 /// archive into rootfs.
@@ -49,11 +136,22 @@ pub struct Ramdisk {
 }
 
 impl Ramdisk {
-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
-    /// boot images carry.
+    /// Unpack a compressed newc archive in whichever framing it came in,
+    /// remembering that framing for [`Ramdisk::encode_with`].
+    pub fn decode_with(compressed: &[u8]) -> Result<(Self, Compression)> {
+        let framing = Compression::of(compressed)?;
+        Ok((Self::decode_as(compressed, framing)?, framing))
+    }
+
+    /// Unpack a compressed newc archive, as Android boot images carry. Its
+    /// own framing is read from the bytes, LZ4 legacy framing by default.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
-        let mut cpio = Vec::new();
-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        let framing = Compression::of(compressed)?;
+        Self::decode_as(compressed, framing)
+    }
+
+    fn decode_as(compressed: &[u8], framing: Compression) -> Result<Self> {
+        let cpio = framing.decompress(compressed)?;
         let mut entries = Vec::new();
         let mut rest = Cursor::new(cpio.as_slice());
         loop {
@@ -84,7 +182,27 @@ impl Ramdisk {
     /// with the reference `lz4` tool in legacy framing (the kernel's initramfs
     /// unpacker reads no other LZ4 framing) at its highest compression.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        lz4_tool(&self.archive()?)
+        self.encode_with(Compression::Lz4Legacy)
+    }
+
+    /// Pack as a newc archive in the framing `framing` names, the one a
+    /// stock image came in: the kernel of that device reads that framing.
+    pub fn encode_with(&self, framing: Compression) -> Result<Vec<u8>> {
+        framing.compress(&self.archive()?)
+    }
+
+    /// Take out every entry whose name is `prefix` or is under `prefix/`,
+    /// as when a custom recovery's own tree is removed from the ramdisk a
+    /// Skyward image is built on. Returns how many entries went.
+    pub fn strip_prefixes(&mut self, prefixes: &[String]) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            !prefixes.iter().any(|p| {
+                let p = p.trim_end_matches('/');
+                e.name == p || e.name.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'))
+            })
+        });
+        before - self.entries.len()
     }
 
     /// Pack as a newc archive, uncompressed.
@@ -296,6 +414,72 @@ fn lz4_tool(input: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ramdisk in each framing reads back the same, and is written back
+    /// in the framing it came in, so the device's kernel can still read it.
+    #[test]
+    fn a_ramdisk_is_read_and_written_back_in_its_own_framing() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/recovery", 0o750, b"binary binary binary".to_vec()).unwrap();
+        rd.add("init", 0o755, b"#!/init\n".to_vec()).unwrap();
+        // A frame-format image is read but always written back in legacy
+        // framing, the only LZ4 framing the kernel's unpacker reads.
+        for framing in [Compression::Lz4Legacy, Compression::Gzip, Compression::Lzma1, Compression::Plain] {
+            let packed = rd.encode_with(framing).unwrap();
+            let (back, found) = Ramdisk::decode_with(&packed).unwrap();
+            assert_eq!(found, framing, "the framing of a {framing:?} ramdisk is read back");
+            let names: Vec<&str> = back.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, rd.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), "a {framing:?} ramdisk keeps its entries");
+            assert_eq!(back.find("system/bin/recovery").unwrap().data, b"binary binary binary");
+        }
+        // The `lz4` tool's default frame format is read all the same.
+        let frame = lz4_tool_frame(&rd.archive().unwrap());
+        assert_eq!(Compression::of(&frame).unwrap(), Compression::Lz4Frame);
+        assert_eq!(Ramdisk::decode(&frame).unwrap().find("init").unwrap().data, b"#!/init\n");
+    }
+
+    fn lz4_tool_frame(archive: &[u8]) -> Vec<u8> {
+        let mut child = Command::new("lz4").args(["-12", "-c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let input = archive.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(out.status.success());
+        out.stdout
+    }
+
+    /// The framing of the Xiaomi Pad 5's OrangeFox ramdisk: LZMA1, with the
+    /// unpacked size left unknown rather than a magic number to go by.
+    #[test]
+    fn an_lzma_ramdisk_with_an_unknown_size_is_read() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("init", 0o755, b"program".to_vec()).unwrap();
+        let packed = rd.encode_with(Compression::Lzma1).unwrap();
+        assert_eq!(packed[0], 0x5d, "the LZMA1 properties byte");
+        assert_eq!(Compression::of(&packed).unwrap(), Compression::Lzma1);
+        assert_eq!(Ramdisk::decode(&packed).unwrap().find("init").unwrap().data, b"program");
+    }
+
+    /// A custom recovery's own tree is taken out, with the rest of the
+    /// ramdisk left alone.
+    #[test]
+    fn stripping_a_prefix_leaves_the_rest() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("twres/ui.xml", 0o644, b"theme".to_vec()).unwrap();
+        rd.add("FFiles/fox.mkshrc", 0o644, b"script".to_vec()).unwrap();
+        rd.add("init", 0o755, b"program".to_vec()).unwrap();
+        rd.add("twresources/keep", 0o644, b"not under twres".to_vec()).unwrap();
+        // A folder's own entry goes with the tree under it, so four go:
+        // twres, twres/ui.xml, FFiles, FFiles/fox.mkshrc.
+        let gone = rd.strip_prefixes(&["twres".into(), "FFiles/".into()]);
+        assert_eq!(gone, 4);
+        let names: Vec<&str> = rd.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"twres/ui.xml") && !names.contains(&"twres"));
+        assert!(!names.contains(&"FFiles/fox.mkshrc") && !names.contains(&"FFiles"));
+        assert!(names.contains(&"init"), "the stock programs stay");
+        assert!(names.contains(&"twresources/keep"), "a name that merely starts alike stays");
+    }
 
     #[test]
     fn round_trip_keeps_metadata() {

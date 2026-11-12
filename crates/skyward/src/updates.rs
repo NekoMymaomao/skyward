@@ -47,7 +47,7 @@ pub enum Task {
     /// phone `codename` names, and write the image into the recovery
     /// partitions of the slot that starts next and of any other slot that
     /// holds Skyward.
-    UpdateSkyward { build: Build, codename: String, path: PathBuf },
+    UpdateSkyward { build: Build, codename: String, path: PathBuf, partition: String },
 }
 
 pub enum Event {
@@ -158,7 +158,7 @@ impl Worker {
                     // of the file itself, which it gives again once one has
                     // run out and is turned down; the release's link on
                     // github.com is tried after it.
-                    Task::UpdateSkyward { build, codename, path } => {
+                    Task::UpdateSkyward { build, codename, path, partition } => {
                         let a = http::agent(servers.clone());
                         *using.lock().expect("the agent is not held by a thread that panicked") = Some(a.clone());
                         let located = github::locate(&a, &build.url, skyward_info::VERSION)
@@ -185,7 +185,7 @@ impl Worker {
                             // Stopping asked for as the last of it came is
                             // stopping still: nothing is written.
                             End::Downloaded if stopping.load(Ordering::Relaxed) => End::Stopped,
-                            End::Downloaded => write(&path, &codename, &tell),
+                            End::Downloaded => write(&path, &codename, &partition, &tell),
                             other => other,
                         };
                         // The zip is held in memory, and is done with once
@@ -355,20 +355,20 @@ fn fetch(
 /// `codename` names, into the recovery partitions of the slot that starts
 /// next and of any other slot that holds Skyward, telling how far that has
 /// come.
-fn write(path: &Path, codename: &str, tell: &dyn Fn(Event)) -> End {
+fn write(path: &Path, codename: &str, partition: &str, tell: &dyn Fn(Event)) -> End {
     let dir = Path::new(skyward_block::BY_NAME);
     let ready = || -> Result<(Vec<u8>, Vec<Slot>)> {
         let image = upgrade::unzip(path)?;
         upgrade::check(&image, codename)?;
         let next = skyward_vab::boot::next_slot().context("ask which slot starts next")?;
-        Ok((image, upgrade::slots(dir, next)?))
+        Ok((image, upgrade::slots(dir, next, partition)?))
     };
     let (image, slots) = match ready() {
         Ok(ready) => ready,
         Err(e) => return End::NotWritten(format!("{e:#}")),
     };
     let mut told: Option<Instant> = None;
-    let written = upgrade::write(dir, &image, &slots, &mut |done, total| {
+    let written = upgrade::write(dir, &image, &slots, partition, &mut |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
             tell(Event::Writing { done, total });
             told = Some(Instant::now());
