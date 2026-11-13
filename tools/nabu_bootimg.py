@@ -44,9 +44,12 @@ def reassemble(work, boot_path, ramdisk_path, out_dir):
     pad = lambda b: b + b"\0" * ((-len(b)) % PAGE)
     body = pad(kernel) + pad(ramdisk)
     part = int(open(os.path.join(work, "partsize")).read())
-    if len(body) > part:
+    # The header is the first page of the partition itself, so the kernel and
+    # ramdisk only fill what is left of it; padding to `part - PAGE` makes the
+    # whole image exactly the partition size rather than a page too large.
+    if len(body) > part - PAGE:
         sys.exit("the new ramdisk overruns the %d-byte partition" % part)
-    body = body + b"\0" * (part - len(body))
+    body = body + b"\0" * (part - PAGE - len(body))
     os.makedirs(out_dir, exist_ok=True)
     name = os.path.basename(boot_path)
     with open(os.path.join(out_dir, name), "wb") as f:

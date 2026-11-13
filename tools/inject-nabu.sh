@@ -4,8 +4,12 @@
 # nabu has no recovery partition: its recovery is the ramdisk of boot, and an
 # update rewrites boot, vendor_boot and dtbo together, so the three are flashed
 # and kept as one boot set. This script does not use skyward-pack. It keeps the
-# OrangeFox R11 base whole -- its init, adbd, SELinux policy, FBE decrypt
-# scripts and the panel driver stay -- and only drops Skyward in:
+# OrangeFox R11 base, de-branded: its 4.14 kernel, first-stage ramdisk,
+# init, adbd, SELinux policy, libraries, firmware and the qcom rc (backlight,
+# UFS, qseecom, boot-control, health) all stay. OrangeFox's own theme,
+# programs and keymaster@4.x qcom_decrypt scripts go: Skyward decrypts data
+# itself through the KeyMint AIDL HAL, so that old HIDL path is unused. Only
+# these are dropped in:
 #
 #   * system/bin/recovery      -> the Skyward binary you built
 #   * system/bin/7za,avbctl,resetprop,unzip,zstd -> links to recovery
@@ -102,6 +106,51 @@ if [ -n "$SYSTEM_INIT" ]; then
 fi
 [ -e "$RD/system/etc/task_profiles.json" ] || cp "$TASK_PROFILES" "$RD/system/etc/task_profiles.json"
 cp "$MTP_RC" "$RD/system/etc/init/skyward-mtp.rc"
+
+# Skyward decrypts data itself through the KeyMint AIDL HAL (skyward-crypto),
+# whose upgradeKey handles keyblobs made by older firmware -- so it covers
+# Android 13-17 on its own. OrangeFox's qcom_decrypt is a keymaster@4.x HIDL
+# path for the old FBE/FDE days; it is not used by Skyward and would only
+# contend for the QSEECOM channel. Strip it, and OrangeFox's own programs and
+# theme, while keeping the generic AOSP recovery plumbing intact: init,
+# sepolicy, linker, libc, first_stage_ramdisk, firmware, fstab, and the qcom
+# rc's backlight / UFS / qseecom / boot-control / health setup.
+if [ "${KEEP_ORANGEFOX:-0}" != "1" ]; then
+    echo "stripping OrangeFox: theme, its programs, and the old keymaster decrypt path..."
+    rm -rf "$RD/twres" "$RD/FFiles"
+    rm -f "$RD/system/bin/fox" "$RD/system/bin/twrp" \
+          "$RD/system/bin/me.twrp.twrpapp.apk" \
+          "$RD/system/bin/privapp-permissions-twrpapp.xml" \
+          "$RD/system/bin/nano_twrp-timestamp" \
+          "$RD/system/bin/tzdata_twrp-timestamp" \
+          "$RD/system/etc/fox.cfg" "$RD/system/etc/twrp.flags" \
+          "$RD/system/lib64/libexfat_twrp.so" "$RD/system/lib64/libgpt_twrp.so" \
+          "$RD/system/lib64/libminuitwrp.so" "$RD/system/lib64/libtwrpdigest.so" \
+          "$RD/system/lib64/libtwrpmtp-ffs.so" \
+          "$RD/sbin/foxstart.sh" "$RD/sbin/fox_list_apps" \
+          "$RD/sbin/mmgui" "$RD/sbin/clearthemes" \
+          "$RD/ramdisk-files.txt" "$RD/ramdisk-files.sha256sum" \
+          "$RD/init.recovery.qcom_decrypt.rc" \
+          "$RD/init.recovery.qcom_decrypt.fbe.rc" \
+          "$RD/init.recovery.services.qcom_decrypt.rc" \
+          "$RD/init.recovery.services.qcom_decrypt.fbe.rc" \
+          "$RD/system/bin/prepdecrypt.sh"
+    # init.recovery.qcom.rc stays: it sets the backlight, the UFS symlink,
+    # /dev/qseecom permissions and the boot-control/health HALs. Only drop
+    # the import of the removed decrypt rc and the prepdecrypt flag.
+    python3 - "$RD/init.recovery.qcom.rc" <<'PY'
+import sys
+p = sys.argv[1]
+try:
+    lines = open(p, encoding="utf-8", errors="replace").read().splitlines(keepends=True)
+except FileNotFoundError:
+    sys.exit(0)
+out = [l for l in lines
+       if "init.recovery.qcom_decrypt.rc" not in l
+       and "prepdecrypt.setpatch" not in l]
+open(p, "w", encoding="utf-8").write("".join(out))
+PY
+fi
 
 echo "patching prop.default..."
 python3 - "$RD/prop.default" <<PY

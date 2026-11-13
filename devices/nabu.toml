@@ -5,6 +5,14 @@
 # is the ramdisk of boot, and boot is 128 MiB in each slot. Skyward does the
 # same here, so the stock image below is taken from the boot partition and
 # the finished image is flashed to boot_a or boot_b, never to recovery.
+#
+# This is a SM8150 / 4.14 non-GKI device, a full generation behind the
+# SM8850 / KeyMint reference port (Xiaomi 17 Pro Max "popsicle"). Nothing in
+# that port's HAL service chain -- onekeymint, weaver, secure_element,
+# se_omapi, its 192 system libraries or VINTF descriptions -- describes this
+# tablet's vendor and none of it is copied here. Only its method is kept:
+# minimal injection, no fatal dependencies, and checking every vendor name
+# on the running device before relying on it.
 
 [device]
 codename = "nabu"
@@ -33,58 +41,100 @@ density = 320
 diagonal = 11.0
 corner_radius = 24
 
+# The 4.14 kernel is not GKI: the panel, touch, UFS and USB drivers are
+# built into the kernel image, which tools/inject-nabu.sh keeps byte for
+# byte, and the OrangeFox base loads no .ko at boot. load_modules() bails --
+# and takes the whole recovery down -- when a named module cannot be found,
+# so nothing is named until the installed vendor has been checked:
+#   adb shell ls /vendor/lib/modules
+# Add a module (e.g. the Novatek NT36523 touch controller) only if it is
+# really a loadable .ko there and modules.dep lists it. A module the kernel
+# already has counts as loaded. The reference port's rule is to load with
+# dependencies by modules.dep, never to guess a name.
 [modules]
-# First-stage modules live in the vendor_boot ramdisk, the rest in vendor.
-# A 4.14 vendor has no vendor_dlkm partition.
 sources = ["vendor_boot", "vendor"]
-# The Novatek NT36523 touch controller on qupv3_se18_spi, named by
-# drivers/input/touchscreen/nt36523/Makefile as nt36523_touch.ko. A module
-# the kernel already has is left alone. The controller reports positions
-# itself, so this tablet needs no touch program or sysfs write, unlike the
-# phones' panels that send raw frames.
-load = ["nt36523_touch"]
+load = []
 
-# The WLAN and secure-world firmware is on the modem partition, mounted at
-# /vendor/firmware_mnt by the phone's own fstab, which a recovery leaves
-# unmounted.
-[firmware]
-partition = "modem"
+# Only a partition that the ramdisk's own fstab mounts can be mounted here:
+# mount_firmware() and fstab::mount() bail -- and take the recovery down --
+# when the table has no such entry. A temporary `fastboot boot` needs none
+# of these to bring the UI up, so they are left disabled. Enable them one
+# at a time after checking `adb shell cat /vendor/etc/fstab.*` on the ROM:
+#
+# [firmware]
+# partition = "modem"       # WLAN / QSEE firmware at /vendor/firmware_mnt
+#
+# [partitions]
+# mounted = ["persist"]     # WLAN MAC address, secure-world files
 
-# /mnt/vendor/persist, where the secure world keeps its files and the WLAN
-# its MAC address.
-[partitions]
-mounted = ["persist"]
-
-# WCN3990 on SM8150, driven by qcacld-3.0. These names follow the stock
-# vendor layout; a ported ROM with a rewritten vendor may name the module
-# or the firmware paths differently, so check /vendor/lib/modules and
-# /vendor/etc/wifi on the running system before relying on Wi-Fi.
-[wlan]
-modules = ["qca_cld3_wlan"]
-firmware = [
-    { name = "wlan/qca_cld/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/WCNSS_qcom_cfg.ini" },
-    { name = "wlan/qca_cld/wlan_mac.bin", partition = "persist", path = "wlan/wlan_mac.bin" },
-]
-interface = "wlan0"
-supplicant = "/vendor/bin/hw/wpa_supplicant"
-libraries = ["/vendor/lib64", "/system/lib64"]
-service = "android.hardware.wifi.supplicant.ISupplicant/default"
-probe = "http://connect.rom.miui.com/generate_204"
+# Wi-Fi likewise waits for a checked vendor. The [wlan].service string is
+# published as a VINTF description by publish_descriptions() during bring-up,
+# and a failure there is fatal too. WCN3990 on SM8150, driven by qcacld-3.0:
+#
+# [wlan]
+# modules = ["qca_cld3_wlan"]
+# firmware = [
+#     { name = "wlan/qca_cld/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/WCNSS_qcom_cfg.ini" },
+#     { name = "wlan/qca_cld/wlan_mac.bin", partition = "persist", path = "wlan/wlan_mac.bin" },
+# ]
+# interface = "wlan0"
+# supplicant = "/vendor/bin/hw/wpa_supplicant"
+# libraries = ["/vendor/lib64", "/system/lib64"]
+# service = "android.hardware.wifi.supplicant.ISupplicant/default"
+# probe = "http://connect.rom.miui.com/generate_204"
 
 # The server the stock updater of the Chinese system asks.
 [update]
 server = "https://update.miui.com/updates/miotaV3.php"
 
+# Data decryption (Android 13-17) is Skyward's own: skyward-crypto connects
+# android.hardware.security.keymint.IKeyMintDevice/default over KeyMint AIDL
+# and calls upgradeKey for keyblobs made by older firmware, so one channel
+# covers every build from 13 to 17 -- no second FBE version and no keymaster
+# HIDL fallback are needed (the crate has none). OrangeFox's qcom_decrypt
+# scripts (keymaster@4.1-qti / gatekeeper@1.0-qti) are a different, unused
+# channel and are stripped by tools/inject-nabu.sh.
+#
+# The HAL is not in this ramdisk; it lives in the vendor partition that a
+# `fastboot boot` mounts from the installed slot, and Skyward starts it from
+# [[service]] entries rather than from init rc. That chain is deliberately
+# left out until the ported ROM's vendor HAL names are known: services::start()
+# bails if a service path is missing (is_file check) or a ready_* wait times
+# out (20 s), and bring_up() propagates that error -- one guessed HAL path
+# here blackscreens the whole recovery. nabu is a generation behind the
+# reference port, so its HAL names, libraries and VINTF set must be read off
+# this device, not copied from another.
+#
+# To enable decryption, list the HALs on the running ROM:
+#   adb shell ls /vendor/bin/hw/ | grep -iE 'keymint|gatekeeper|qseecom|weaver|secure'
+#   adb shell cat /vendor/etc/vintf/manifest.xml
+# then add [[service]] blocks under these anti-blackscreen rules (reference
+# port, section 3.4 -- these are METHOD, not a HAL list to copy):
+#   * no ready_property / ready_service / ready_hardware_service /
+#     description: each adds a 20 s wait that bails on failure. Services are
+#     supervised asynchronously; one HAL failing costs only that feature.
+#   * user = "root", groups = ["root"]: recovery's ueventd knows no other
+#     accounts and Credentials::of() bails on an unknown one.
+#   * registers = [...] is safe (only publishes VINTF descriptions).
+#   * libraries = ["/system/lib64", "/vendor/lib64"], system first: a
+#     vendor-first libbinder causes "mixing copies" addService failures.
+#   * put any copied HAL in /sbin, the one place a partition mount cannot
+#     cover; never declare the same <fqname> twice (Conflicting FqInstance).
+# Rebuild with tools/inject-nabu.sh afterwards so the checked device.toml
+# goes into the ramdisk.
+
 # nabu has no recovery partition: its recovery is the ramdisk of boot, and
-# the recovery is built by hand rather than by skyward-pack. The base is
-# the OrangeFox R11 recovery (which already brings the 4.14 kernel, the
-# first-stage ramdisk, the FBE decrypt scripts and the panel's driver),
-# with Skyward overwritten into system/bin/recovery; vendor_boot and dtbo
-# are the device's own, flashed beside boot as one boot set. The recovery
-# and companion sums below name that base, so a flashed image can be
-# checked against it; they are not read by skyward-pack, which nabu does
-# not use. Rebuild with tools/inject-nabu.sh against the built skyward and
-# system-init binaries and these base images.
+# the recovery is built by hand rather than by skyward-pack. The base is a
+# stripped OrangeFox R11 boot: its 4.14 kernel, first-stage ramdisk, init,
+# sepolicy, adbd, libraries, firmware and the qcom rc's backlight / UFS /
+# qseecom / boot-control / health setup all stay, while OrangeFox's own
+# programs, theme and keymaster@4.x decrypt scripts are removed. Skyward is
+# overwritten into system/bin/recovery; vendor_boot and dtbo are the device's
+# own, flashed beside boot as one boot set. The recovery and companion sums
+# below name that base, so a flashed image can be checked against it; they
+# are not read by skyward-pack, which nabu does not use. Rebuild with
+# tools/inject-nabu.sh against the built skyward and system-init binaries
+# and these base images.
 #
 #   boot.img        ddbb44db7209bd8913fc4dd5f7b55045ebbe1cec4d3a16533d7eafb7fc7d4566
 #   vendor_boot.img b1b4e4d9bfc1b3a6457667ed7d8baa434bd18013c0bb3f8ce3dd72698f73e7dd
